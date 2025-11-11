@@ -37,7 +37,20 @@ impl<'a> DiffEngine<'a> {
         let new_node = self.new_tree.get(new_key);
 
         match (old_node, new_node) {
-            (None, Some(node)) => self.insert_node(node, None)?,
+            (None, Some(node)) => {
+                // Insert the new node, then recursively handle its children
+                self.insert_node(node, None)?;
+
+                // Determine the correct parent_html_id for children (parity with update_node)
+                let child_parent_id = if node.widget_type == "StatefulWidget" || node.widget_type == "StatelessWidget" {
+                    &node.parent_html_id
+                } else {
+                    &node.html_id
+                };
+
+                // Reconcile children: there are no old keys for this subtree
+                self.diff_children(&[] as &[String], &node.children_keys, child_parent_id, &node.key)?;
+            }
             (Some(old), Some(new)) => {
                 if old.widget_type != new.widget_type || old.key != new.key {
                     // Type mismatch - replace entire subtree
@@ -122,9 +135,20 @@ impl<'a> DiffEngine<'a> {
                     "before_id": before_id,
                 }),
             });
+            // DEBUG: Log inserted renderable node
+            println!(
+                "DiffEngine: inserted node key='{}' html_id='{}' parent_html_id='{}' widget_type='{}'",
+                node.key, node.html_id, node.parent_html_id, node.widget_type
+            );
         }
 
         self.result.new_rendered_map.insert(node.key.clone(), node.clone());
+        // DEBUG: Log new_rendered_map insertion
+        println!(
+            "DiffEngine: new_rendered_map insert key='{}' total_entries={}",
+            node.key,
+            self.result.new_rendered_map.len()
+        );
         Ok(())
     }
 
@@ -135,6 +159,15 @@ impl<'a> DiffEngine<'a> {
         parent_html_id: &str,
         parent_key: &str,
     ) -> Result<(), ReconcilerError> {
+        // DEBUG: Log what diff_children is being called with
+        println!(
+            "DiffEngine::diff_children: old_keys.len={} new_keys.len={} parent_key='{}' new_keys={:?}",
+            old_keys.len(),
+            new_keys.len(),
+            parent_key,
+            new_keys
+        );
+
         if old_keys.is_empty() && new_keys.is_empty() {
             return Ok(());
         }
@@ -204,10 +237,23 @@ impl<'a> DiffEngine<'a> {
             } else {
                 // New node
                 let new_node = self.new_tree.get(new_key).unwrap();
+                // DEBUG: Log which new child we're about to insert
+                println!(
+                    "DiffEngine::diff_children: about to insert new child key='{}' from new_tree",
+                    new_key
+                );
                 let mut node_clone = new_node.clone();
                 node_clone.parent_html_id = parent_html_id.to_string();
                 node_clone.parent_key = Some(parent_key.to_string());
                 self.insert_node(&node_clone, before_id)?;
+
+                // CRITICAL: After inserting a new node, recursively reconcile its children
+                let child_parent_id = if new_node.widget_type == "StatefulWidget" || new_node.widget_type == "StatelessWidget" {
+                    parent_html_id
+                } else {
+                    &new_node.html_id
+                };
+                self.diff_children(&[] as &[String], &new_node.children_keys, child_parent_id, new_key)?;
             }
         }
 

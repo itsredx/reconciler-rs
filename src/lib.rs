@@ -6,7 +6,7 @@ mod html_generator;
 mod types;
 
 use crate::errors::ReconcilerError;
-use crate::html_generator::map_to_json_value;
+use crate::html_generator::{generate_html_stub as rust_generate_html_stub, map_to_json_value};
 use converters::{json_to_pyobject, py_dict_to_rust_map};
 use diff_engine::DiffEngine;
 use pyo3::exceptions::PyValueError;
@@ -66,9 +66,9 @@ impl Reconciler {
             is_partial_reconciliation,
             old_root_key,
         );
-        
+
         let old_map = self
-        .build_rust_node_map(py, previous_map_bound)
+            .build_rust_node_map(py, previous_map_bound)
             .map_err(|e| PyValueError::new_err(format!("Failed to parse previous_map: {}", e)))?;
 
         // Build new tree map
@@ -77,14 +77,31 @@ impl Reconciler {
             // FIX: Bind Py<PyAny> to get &Bound<PyAny>
             let root_bound = root.bind(py);
             self.build_new_tree_map(py, root_bound, &parent_html_id, None, &mut new_map)?;
+            println!("Reconciler: Built new_map with {} entries.", new_map.len());
+            for k in new_map.keys() {
+                println!("Reconciler: new_map key => {}", k);
+            }
         }
 
         let mut rust_result = RustReconciliationResult::default();
 
-        // Determine root key
+        // Determine root key. Prefer an explicit old_root_key. If missing,
+        // try to find a root in the old map. If still not found (initial
+        // render), fall back to discovering a root in the newly-built map so
+        // the diff engine can start from the actual new root widget. Only
+        // default to the literal "root" as a last resort.
         let root_key = old_root_key
             .or_else(|| {
                 old_map
+                    .iter()
+                    .find(|(_, data)| {
+                        data.parent_html_id == parent_html_id && data.parent_key.is_none()
+                    })
+                    .map(|(k, _)| k.clone())
+            })
+            .or_else(|| {
+                // If nothing in the old map, try to find the root in the new map
+                new_map
                     .iter()
                     .find(|(_, data)| {
                         data.parent_html_id == parent_html_id && data.parent_key.is_none()
@@ -97,6 +114,15 @@ impl Reconciler {
         let mut engine = DiffEngine::new(py, &old_map, &new_map, &mut rust_result);
         engine.reconcile(Some(&root_key))?;
 
+        // DEBUG: Log chosen root key and map sizes so we can trace why
+        // the diff engine may produce no patches during initial render.
+        println!(
+            "Reconciler: chosen root_key='{}' | old_map size={} | new_map size={}",
+            root_key,
+            old_map.len(),
+            new_map.len()
+        );
+
         // Handle removals for non-partial reconciliation
         if !is_partial_reconciliation {
             let old_keys: HashSet<_> = old_map.keys().collect();
@@ -104,7 +130,8 @@ impl Reconciler {
             let removed: Vec<_> = old_keys.difference(&new_keys).cloned().collect();
 
             for key in removed {
-                if let Some(data) = old_map.get(key) { // FIX: key is already &String
+                if let Some(data) = old_map.get(key) {
+                    // FIX: key is already &String
                     // Dispose stateful widgets
                     if data.widget_type == "StatefulWidget" {
                         if let Some(ref instance) = data.widget_instance {
@@ -128,7 +155,30 @@ impl Reconciler {
             }
         }
 
-        Ok(self.rust_result_to_python(py, rust_result)?)
+        // Return the serialized python result for the reconciliation
+        // (the last expression is returned to Python as PyResult<Bound<PyAny>>)
+        self.rust_result_to_python(py, rust_result)
+    }
+
+    /// Expose a Rust-backed HTML stub generator as a method on the Reconciler pyclass.
+    /// This allows Python code to call into Rust for HTML generation without
+    /// falling back to Python implementations.
+    #[pyo3(name = "generate_html_stub")]
+    fn generate_html_stub_py<'py>(
+        &self,
+        py: Python<'py>,
+        widget: Py<PyAny>,
+        html_id: String,
+        props: Py<PyAny>,
+    ) -> PyResult<String> {
+        // Convert incoming props (a Python dict) into Rust serde_json map
+        let props_bound = props.bind(py);
+        let props_map = py_dict_to_rust_map(py, &props_bound)
+            .map_err(|e| PyValueError::new_err(format!("Failed to convert props: {}", e)))?;
+
+        // Delegate to the common Rust HTML generator
+        rust_generate_html_stub(py, widget, &html_id, &props_map)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 }
 
@@ -139,14 +189,46 @@ impl Reconciler {
         py: Python<'py>,
         py_dict: &Bound<'py, PyDict>,
     ) -> Result<HashMap<String, RustNodeData>, ReconcilerError> {
+        println!("Reconciler: Building Rust node map from Python dict.");
         let mut map = HashMap::new();
 
         // FIX: Use iter() instead of items() - PyO3 0.27+ uses iter()
+        println!(
+            "Building Rust node map from Python dict with {} items.",
+            py_dict.len()
+        );
         for item_result in py_dict.iter() {
+            println!(
+                "Building Rust node map from Python dict with {} items.",
+                py_dict.len()
+            );
             let (key_obj, value) = item_result; // FIX: iter() returns tuples, not Results
-            let key_str: String = key_obj.extract().map_err(|e| ReconcilerError::KeyError {
-                details: format!("Invalid key in previous_map: {}", e),
-            })?;
+                                                // Keys in the Python `previous_map` may be plain strings or `Key` objects.
+                                                // Try extracting a String directly, otherwise attempt to call the
+                                                // widget's `__str_key__` helper or fall back to Python `str()`.
+            println!("Processing key object: {:?}", key_obj);
+            let key_str: String = match key_obj.extract::<String>() {
+                Ok(s) => s,
+                Err(_) => {
+                    // Try __str_key__ method if present (preferred for Key objects)
+                    if let Ok(m) = key_obj.getattr("__str_key__") {
+                        let v = m.call0()?;
+                        v.extract::<String>()
+                            .map_err(|e| ReconcilerError::KeyError {
+                                details: format!("Key.__str_key__ did not return a string: {}", e),
+                            })?
+                    } else {
+                        // Fallback: use Python's str() conversion
+                        let s = key_obj.str()?;
+                        s.to_str().map(|s| s.to_string()).map_err(|e| {
+                            ReconcilerError::KeyError {
+                                details: format!("Cannot convert key to string: {}", e),
+                            }
+                        })?
+                    }
+                }
+            };
+            println!("Resolved key string: {}", key_str);
 
             let data_dict = value
                 // FIX: Use cast instead of deprecated downcast
@@ -163,12 +245,14 @@ impl Reconciler {
             };
 
             // FIX: Store get_item result to avoid temporary value drop
-            let props_item = data_dict.get_item("props")?
+            let props_item = data_dict
+                .get_item("props")?
                 .ok_or(ReconcilerError::KeyError {
                     details: "Missing 'props' in node dict".into(),
                 })?;
             // FIX: Use cast instead of deprecated downcast
-            let props_dict = props_item.cast::<PyDict>()
+            let props_dict = props_item
+                .cast::<PyDict>()
                 .map_err(|e| ReconcilerError::PythonError(e.to_string()))?;
             let props = py_dict_to_rust_map(py, props_dict)?;
 
@@ -211,10 +295,36 @@ impl Reconciler {
         map: &mut HashMap<String, RustNodeData>,
     ) -> PyResult<()> {
         // FIX: Bind and call methods on Bound, not Py<T>
-        let widget_key = widget
-            .getattr("get_unique_id")?
-            .call0()?
-            .extract::<String>()?;
+        // Safely obtain the widget's unique key as a String. The Python
+        // `get_unique_id()` may return either a plain `str` or a `Key` object.
+        // Try extracting a String directly; if that fails, try calling a
+        // `__str_key__` method on the returned object, otherwise fall back to
+        // Python's str(). This mirrors the defensive logic used when reading
+        // the previous_map so both sides agree on key stringification.
+        let widget_key_obj = widget.getattr("get_unique_id")?.call0()?;
+        let widget_key: String = match widget_key_obj.extract::<String>() {
+            Ok(s) => s,
+            Err(_) => {
+                if let Ok(m) = widget_key_obj.getattr("__str_key__") {
+                    let v = m.call0()?;
+                    v.extract::<String>()
+                        .map_err(|e| ReconcilerError::KeyError {
+                            details: format!(
+                                "get_unique_id().__str_key__ did not return a string: {}",
+                                e
+                            ),
+                        })?
+                } else {
+                    let s = widget_key_obj.str()?;
+                    s.to_str()
+                        .map(|s| s.to_string())
+                        .map_err(|e| ReconcilerError::KeyError {
+                            details: format!("Cannot convert widget key to string: {}", e),
+                        })?
+                }
+            }
+        };
+        println!("build_new_tree_map: widget key resolved = {}", widget_key);
         let html_id = types::next_id();
 
         // Obtain props by calling widget.render_props() on the Python side
@@ -231,9 +341,32 @@ impl Reconciler {
             PyValueError::new_err(format!("get_children did not return a list: {}", e))
         })?;
         let mut children_keys: Vec<String> = Vec::new();
-        for child_result in children_list.iter() { // iter() yields Bound, not Result
+        for child_result in children_list.iter() {
+            // iter() yields Bound, not Result
             let child = child_result;
-            let id: String = child.getattr("get_unique_id")?.call0()?.extract()?;
+            let child_key_obj = child.getattr("get_unique_id")?.call0()?;
+            let id: String = match child_key_obj.extract::<String>() {
+                Ok(s) => s,
+                Err(_) => {
+                    if let Ok(m) = child_key_obj.getattr("__str_key__") {
+                        let v = m.call0()?;
+                        v.extract::<String>()
+                            .map_err(|e| ReconcilerError::KeyError {
+                                details: format!(
+                                    "child.get_unique_id().__str_key__ did not return a string: {}",
+                                    e
+                                ),
+                            })?
+                    } else {
+                        let s = child_key_obj.str()?;
+                        s.to_str().map(|s| s.to_string()).map_err(|e| {
+                            ReconcilerError::KeyError {
+                                details: format!("Cannot convert child key to string: {}", e),
+                            }
+                        })?
+                    }
+                }
+            };
             children_keys.push(id);
         }
 
@@ -263,7 +396,8 @@ impl Reconciler {
             &html_id
         };
 
-        for child_item in children_list.iter() { // iter() yields Bound, not Result
+        for child_item in children_list.iter() {
+            // iter() yields Bound, not Result
             let child = child_item;
             self.build_new_tree_map(py, &child, child_parent_id, Some(&widget_key), map)?;
         }
@@ -280,14 +414,23 @@ impl Reconciler {
 
         // Convert patches
         let patches_list = PyList::empty(py);
-        for patch in rust_result.patches {
+        for patch in &rust_result.patches {
             let patch_dict = PyDict::new(py);
             patch_dict.set_item("action", patch.action.to_string())?;
-            patch_dict.set_item("html_id", patch.html_id)?;
+            patch_dict.set_item("html_id", patch.html_id.clone())?;
             patch_dict.set_item("data", json_to_pyobject(py, &patch.data)?)?;
             patches_list.append(patch_dict)?;
         }
         result.set_item("patches", patches_list)?;
+
+        // DEBUG: After reconciliation, report patch/new_map counts for visibility
+        println!(
+                "Reconciler: rust_result.patches={} new_rendered_map={} js_initializers={} callbacks={}",
+                rust_result.patches.len(),
+                rust_result.new_rendered_map.len(),
+                rust_result.js_initializers.len(),
+                rust_result.registered_callbacks.len()
+            );
 
         // Convert new_rendered_map
         let rendered_map = PyDict::new(py);
@@ -342,6 +485,23 @@ impl Reconciler {
 
 #[pymodule]
 fn rust_reconciler(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Expose module-level helper for HTML stub generation so Python can call
+    // `rust_reconciler.generate_html_stub(widget, html_id, props)` directly.
+    #[pyfunction]
+    fn generate_html_stub(
+        py: Python,
+        widget: Py<PyAny>,
+        html_id: String,
+        props: Py<PyAny>,
+    ) -> PyResult<String> {
+        let props_bound = props.bind(py);
+        let props_map = py_dict_to_rust_map(py, &props_bound)
+            .map_err(|e| PyValueError::new_err(format!("Failed to convert props: {}", e)))?;
+        rust_generate_html_stub(py, widget, &html_id, &props_map)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    m.add_function(wrap_pyfunction!(generate_html_stub, m)?)?;
     // FIX: m is now &Bound<PyModule>, use add_class/add functions
     m.add_class::<Reconciler>()?;
 
