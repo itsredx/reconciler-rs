@@ -67,6 +67,7 @@ pub struct RustPatch {
 /// Thread-safe node data with proper Py<PyAny> storage
 pub struct RustNodeData {
     pub html_id: String,
+    pub html: String,
     pub widget_type: String,
     pub key: String,
     pub widget_instance: Option<Py<PyAny>>,  // Thread-safe: Py<PyAny> is Send
@@ -86,6 +87,7 @@ impl Clone for RustNodeData {
 
         RustNodeData {
             html_id: self.html_id.clone(),
+            html: self.html.clone(),
             widget_type: self.widget_type.clone(),
             key: self.key.clone(),
             widget_instance,

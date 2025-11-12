@@ -270,6 +270,7 @@ impl Reconciler {
 
             let node = RustNodeData {
                 html_id: crate::safe_get!(data_dict, "html_id", String),
+                html: crate::safe_get!(data_dict, "html", String),
                 widget_type: crate::safe_get!(data_dict, "widget_type", String),
                 key: crate::safe_get!(data_dict, "key", String),
                 widget_instance,
@@ -375,8 +376,19 @@ impl Reconciler {
         // FIX: widget is already Bound, clone it into Py<PyAny>
         let widget_instance_py: Py<PyAny> = widget.clone().into();
 
+        // Generate HTML stub for the widget using Rust generator to keep parity
+    let generated_html = match rust_generate_html_stub(py, widget_instance_py.clone_ref(py), &html_id, &props) {
+            Ok(s) => s,
+            Err(e) => {
+                // Fallback to empty string on error but log for debugging
+                println!("Reconciler: warning - html generation failed for {}: {}", widget_key, e);
+                String::new()
+            }
+        };
+
         let node = RustNodeData {
             html_id: html_id.clone(),
+            html: generated_html,
             widget_type: widget_type.clone(),
             key: widget_key.clone(),
             widget_instance: Some(widget_instance_py), // Py<PyAny> is thread-safe
@@ -388,13 +400,15 @@ impl Reconciler {
 
         map.insert(widget_key.clone(), node);
 
-        // EXACT Python parity: Stateful/Stateless children use parent_html_id
-        let child_parent_id = if widget_type == "StatefulWidget" || widget_type == "StatelessWidget"
-        {
-            parent_html_id
-        } else {
-            &html_id
-        };
+        // Determine whether this widget type renders a real DOM element.
+        // Treat a small set of known non-renderable/internal types as non-renderable
+        // so their children are attached to the nearest renderable ancestor.
+        let is_renderable = !(widget_type == "StatefulWidget" || widget_type == "StatelessWidget" || widget_type == "_WidgetProxy");
+
+        // EXACT Python parity: children of non-renderable widgets use the parent's
+        // html id (the nearest renderable ancestor). Children of renderable
+        // widgets attach to this widget's generated html_id.
+        let child_parent_id = if is_renderable { &html_id } else { parent_html_id };
 
         for child_item in children_list.iter() {
             // iter() yields Bound, not Result
@@ -439,6 +453,7 @@ impl Reconciler {
             node_dict.set_item("html_id", node.html_id)?;
             node_dict.set_item("widget_type", node.widget_type)?;
             node_dict.set_item("key", node.key)?;
+            node_dict.set_item("html", node.html)?;
             node_dict.set_item(
                 "widget_instance",
                 node.widget_instance.unwrap_or_else(|| py.None().into()),

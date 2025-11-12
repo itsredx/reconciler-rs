@@ -1,7 +1,7 @@
 //! Zero-panic conversion utilities with explicit error handling
 use crate::errors::ReconcilerError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule};
+use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 
 /// Convert Python dict to Rust HashMap with detailed errors
@@ -29,16 +29,77 @@ pub fn python_to_json<'py>(
     py: Python<'py>, 
     obj: &Bound<'py, PyAny>
 ) -> Result<serde_json::Value, ReconcilerError> {
-    let json_mod = PyModule::import(py, "json").map_err(|e: PyErr| ReconcilerError::PythonError(e.to_string()))?;
-    let dumps = json_mod.getattr("dumps").map_err(|e: PyErr| ReconcilerError::PythonError(e.to_string()))?;
+    use serde_json::Value;
 
-    let dumped = dumps.call1((obj,)).map_err(|e: PyErr| ReconcilerError::PythonError(e.to_string()))?;
-    
-    let s: String = dumped.extract().map_err(|e: PyErr| ReconcilerError::PythonError(e.to_string()))?;
-    serde_json::from_str(&s).map_err(|e| ReconcilerError::TypeConversionError {
-        expected: "JSON-serializable type".into(),
-        actual: e.to_string(),
-    })
+    // Recursive conversion from Python object to serde_json::Value
+    fn convert<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> Result<Value, ReconcilerError> {
+        // None
+        if obj.is_none() {
+            return Ok(Value::Null);
+        }
+
+        // Primitives
+        if let Ok(b) = obj.extract::<bool>() {
+            return Ok(Value::Bool(b));
+        }
+
+        if let Ok(i) = obj.extract::<i64>() {
+            return Ok(Value::Number(serde_json::Number::from(i)));
+        }
+
+        if let Ok(f) = obj.extract::<f64>() {
+            if let Some(n) = serde_json::Number::from_f64(f) {
+                return Ok(Value::Number(n));
+            } else {
+                return Ok(Value::Null);
+            }
+        }
+
+        if let Ok(s) = obj.extract::<String>() {
+            return Ok(Value::String(s));
+        }
+
+        // Lists / tuples / sequences
+        if let Ok(list) = obj.cast::<PyList>() {
+            let mut vec = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                vec.push(convert(py, &item)?);
+            }
+            return Ok(Value::Array(vec));
+        }
+
+        // Dicts
+        if let Ok(dict) = obj.cast::<PyDict>() {
+            let mut map = serde_json::Map::new();
+            for (k, v) in dict {
+                // stringify key
+                let key = match k.str() {
+                    Ok(pystr) => pystr.to_str().map(|s| s.to_string()).unwrap_or_else(|_| format!("{}", k.repr().map(|r| r.to_string()).unwrap_or_default())),
+                    Err(_) => format!("{}", k.repr().map(|r| r.to_string()).unwrap_or_default()),
+                };
+                let val = convert(py, &v)?;
+                map.insert(key, val);
+            }
+            return Ok(Value::Object(map));
+        }
+
+        // Callables / functions / methods -> treat as null (like Python None)
+        // Check if the object itself is callable, not just if it has __call__
+        if obj.is_callable() {
+            return Ok(Value::Null);
+        }
+
+        // If it's a PyAny that didn't match above, try to coerce via str()
+        match obj.str() {
+            Ok(s) => match s.to_str() {
+                Ok(st) => Ok(Value::String(st.to_string())),
+                Err(_) => Ok(Value::String("<non-utf8-str>".to_string())),
+            },
+            Err(e) => Err(ReconcilerError::PythonError(e.to_string())),
+        }
+    }
+
+    convert(py, obj)
 }
 
 /// Convert JSON back to Python with proper type mapping

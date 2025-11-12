@@ -60,6 +60,16 @@ pub fn generate_html_stub<'py>(
             });
     }
 
+    // Special-case VirtualListView to match Python's initial render stub
+    if widget_type_name == "VirtualListView" {
+        let s = format!(
+            "<div id=\"{id}\" class=\"{classes}\" style=\"color: peach;\">\n<div class=\"viewport\" id=\"{id}_viewport\">\n    <div class=\"phantom\"></div>\n</div>\n</div>",
+            id = html_id,
+            classes = props.get("css_class").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        return Ok(s);
+    }
+
     generate_generic_stub(py, widget, html_id, props)
 }
 
@@ -118,8 +128,8 @@ fn generate_generic_stub<'py>(
                             html_id, classes, html_escape(icon_name)));
                     }
                 }
-                // Font Awesome
-                return Ok(format!(r#"<i id="{}" class="{} {}"></i>"#, 
+                // Font Awesome: put the icon name as inner HTML (matches Python)
+                return Ok(format!(r#"<i id="{}" class="{}">{}</i>"#, 
                     html_id, classes, html_escape(icon_name)));
             }
         }
